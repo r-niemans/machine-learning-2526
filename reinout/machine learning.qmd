@@ -1,0 +1,329 @@
+---
+title: "machine learning"
+author: "Reinout Schols"
+format:
+  html:
+    html-table-processing: none
+editor: visual
+execute:
+  echo: true
+  warning: false
+---
+
+```{r results: hide}
+library(tidyverse)
+library(data.table)
+library(ggplot2)
+library(arrow)   # Optional: for fast reading if using parquet/csv.gz
+library(gganimate)
+library(ggplot2)
+library(factoextra)
+library(glmnet)
+library(gt)
+library(gridExtra)
+```
+
+```{r}
+# -------------------------------
+# 1. Define data directories
+# -------------------------------
+data_dir <- "C:/machine learning/train"
+
+input_files <- list.files(data_dir, pattern = "input_.*\\.csv", full.names = TRUE)
+output_files <- list.files(data_dir, pattern = "output_.*\\.csv", full.names = TRUE)
+
+cat("Found", length(input_files), "input files and", length(output_files), "output files.\n")
+
+# -------------------------------
+# 2. Load and combine CSVs using data.table for speed
+# -------------------------------
+input_data <- rbindlist(lapply(input_files, fread), use.names = TRUE)
+output_data <- rbindlist(lapply(output_files, fread), use.names = TRUE)
+
+cat("Input shape:", dim(input_data), "\n")
+cat("Output shape:", dim(output_data), "\n")
+
+# -------------------------------
+# 3. Filter only players to predict
+# -------------------------------
+input_filtered <- input_data[player_to_predict == TRUE]
+cat("Filtered input shape:", dim(input_filtered), "\n")
+
+# -------------------------------
+# 4. Merge input and output
+# -------------------------------
+merged_data <- merge(
+  input_filtered,
+  output_data,
+  by = c("game_id", "play_id", "nfl_id", "frame_id"),
+  suffixes = c("_input", "_output")
+)
+cat("Merged data shape:", dim(merged_data), "\n")
+
+# -------------------------------
+# 5. Convert height from "6-1" to inches
+# -------------------------------
+height_to_inches <- function(height_str) {
+  sapply(height_str, function(h) {
+    if (!is.na(h) && grepl("-", h)) {
+      parts <- strsplit(h, "-")[[1]]
+      as.numeric(parts[1]) * 12 + as.numeric(parts[2])
+    } else {
+      NA
+    }
+  })
+}
+
+merged_data[, player_height := height_to_inches(player_height)]
+
+# -------------------------------
+# 6. Encode play_direction
+# -------------------------------
+merged_data[, play_direction_encoded := as.integer(play_direction == "right")]
+
+# -------------------------------
+# 7. One-hot encode categorical variables
+# -------------------------------
+# player_position
+position_dummies <- as.data.table(model.matrix(~ player_position - 1, merged_data))
+# player_role
+role_dummies <- as.data.table(model.matrix(~ player_role - 1, merged_data))
+
+# Bind one-hot columns
+merged_data <- cbind(merged_data, position_dummies, role_dummies)
+
+# -------------------------------
+# 8. Compute BMI
+# -------------------------------
+merged_data[, bmi := (player_weight / (player_height^2)) * 703]
+
+# -------------------------------
+# 9. Select features and target
+# -------------------------------
+feature_columns <- c(
+  'absolute_yardline_number', 'player_height', 'player_weight',
+  'x_input', 'y_input', 's', 'a', 'dir', 'o',
+  'num_frames_output', 'ball_land_x', 'ball_land_y', 'bmi',
+  'play_direction_encoded'
+)
+
+feature_columns <- c(feature_columns, colnames(position_dummies), colnames(role_dummies))
+
+X <- merged_data[, ..feature_columns]
+y_x <- merged_data$x_output
+y_y <- merged_data$y_output
+
+cat("Features shape:", dim(X), "\n")
+cat("Target X shape:", length(y_x), "\n")
+cat("Target Y shape:", length(y_y), "\n")
+
+# -------------------------------
+# 10. Save preprocessed data to Parquet for fast reload
+# -------------------------------
+write_parquet(merged_data, "cleaned_nfl_merged.parquet")
+write_parquet(as.data.table(X), "cleaned_nfl_features.parquet")
+write_parquet(data.table(x_output = y_x, y_output = y_y), "cleaned_nfl_targets.parquet")
+
+cat("Preprocessing complete. Files saved as Parquet.\n")
+```
+
+# Feature engineering
+
+```{r}
+merged_data[, player_age := as.numeric(difftime(Sys.Date(), as.Date(player_birth_date), units="days")) / 365.25]
+
+# Height in meters
+merged_data[, player_height_m := player_height * 0.0254]
+
+# Weight in kg
+merged_data[, player_weight_kg := player_weight * 0.453592]
+
+# Coordinates in meters
+coords <- c("x_input", "y_input", "ball_land_x", "ball_land_y")
+for (col in coords) {
+  merged_data[, (paste0(col, "_m")) := get(col) * 0.9144]
+}
+
+# Speed and acceleration in m/s and m/s²
+merged_data[, s_mps := s * 0.9144]
+merged_data[, a_mps2 := a * 0.9144]
+
+# Distance to ball (meters)
+merged_data[, dist_to_ball_m := sqrt((x_input_m - ball_land_x_m)^2 + (y_input_m - ball_land_y_m)^2)]
+
+# Kinetic energy (Joules)
+merged_data[, kinetic_energy := 0.5 * player_weight_kg * s_mps^2]
+
+merged_data[, dist_to_sideline := pmin(y_input_m, 48.8 - y_input_m)]
+merged_data[, dist_to_endzone := 109.7 - x_input_m]  # assuming offense moving right
+```
+
+# Data exploration (simple histograms)
+
+```{r}
+dim(merged_data)
+ggplot(merged_data, aes(x = s_mps)) +
+  geom_histogram(bins = 50, fill = "blue", alpha = 0.5) +
+  labs(title = "Player Speed Distribution", x = "Speed (M/S)")
+
+ggplot(merged_data, aes(x = a_mps2)) +
+  geom_histogram(bins = 50, fill = "red", alpha = 0.5) +
+  labs(title = "Player Acceleration Distribution", x = "Acceleration (m/s^2)")
+
+ggplot(merged_data, aes(x = player_weight_kg)) +
+  geom_histogram(bins = 50, fill = "green", alpha = 0.5) +
+  labs(title = "Player mass distribution", x = "mass (kg)")
+
+ggplot(merged_data, aes(x = player_age)) +
+  geom_histogram(bins = 50, fill = "darkorange", alpha = 0.5) +
+  labs(title = "Player age distribution", x = "age")
+
+ggplot(merged_data, aes(x = player_height_m)) +
+  geom_histogram(bins = 15, fill = "purple", alpha = 0.5) +
+  labs(title = "Player height distribution", x = "height in meters")
+
+ggplot(merged_data, aes(x = kinetic_energy)) +
+  geom_histogram(bins = 15, fill = "purple", alpha = 0.5) +
+  labs(title = "Player kinetic energy distribution", x = "kinetic energy (Joules)")
+```
+
+# Data exploration (PCA)
+
+```{r}
+pca_features <- cbind(
+  merged_data[, .(x_input_m, y_input_m, s_mps, a_mps2, dir, o,
+                  dist_to_ball_m, kinetic_energy,
+                  ball_land_x_m, ball_land_y_m, player_height_m,
+                  player_weight_kg, bmi, player_age,
+                  absolute_yardline_number, dist_to_sideline, dist_to_endzone)]
+)
+
+pca_scaled <- scale(pca_features)
+pca_res <- princomp(pca_scaled)
+pca_sum <- summary(pca_res)
+fviz_eig(pca_res, addlabels = TRUE, ylim = c(0, 50))
+
+```
+
+# Creating table for principal components
+
+```{r}
+
+var_explained <- pca_res$sdev^2 / sum(pca_res$sdev^2)
+cum_var <- cumsum(var_explained)
+
+# Make tibble
+tibble_pca <- tibble(
+  PC = paste0("PC", 1:length(var_explained)),
+  `Variance Explained` = var_explained,
+  `Cumulative Variance` = cum_var
+) %>%
+  mutate(
+    `Variance Explained` = round(`Variance Explained`, 3),
+    `Cumulative Variance` = round(`Cumulative Variance`, 3)
+  )
+
+# Make nice gt table
+tibble_pca %>% slice_head(n = 10) %>%
+  gt() %>%
+  tab_header(title = "Proportion of Variance Explained per component") %>%
+  fmt_percent(columns = c(`Variance Explained`, `Cumulative Variance`), decimals = 1) %>%
+  opt_stylize(style = 3) %>% tab_style(
+    style = list(cell_fill(color = "lightblue")),
+    locations = cells_body(rows = 1:5)
+  )
+
+
+fviz_eig(pca_res, addlabels = TRUE, ylim = c(0, 30))
+```
+
+# inspecting data loadings
+
+```{r}
+color_palette <- c("#CC79A7", "#009E73")
+loadings_first4 <- as_tibble(pca_res$loadings[, 1:5])
+
+loadings_first4  %>% gt() %>% cols_add(feature = names(pca_features)) %>% opt_stylize(style = 2) %>%
+  tab_header(title = "Loadings for the first 5 components") %>% fmt_number(decimals = 2, locale = "de") %>% cols_move_to_start(columns = feature) %>% cols_label("Comp.1" = "PC1", "Comp.2" = "PC2", "Comp.3" = "PC3", "Comp.4" = "PC4", "Comp.5" = "PC5") %>% data_color(method = "numeric", palette = color_palette, domain = c(-0.8,0.52))
+```
+
+#Bi plot
+
+```{r}
+fviz_pca_var(
+  pca_res,
+  col.var = "contrib",
+  gradient.cols = c("#440154", "#31688E", "#35B779", "#FDE725"),
+  repel = TRUE,
+  geom.var = c("arrow", "text"),
+  select.var = list(contrib = 10)
+)
+
+fviz_pca_var(
+  pca_res,
+  axes = c(2, 5),                        # <-- choose which PCs to plot
+  col.var = "contrib",
+  gradient.cols = c("#440154", "#31688E", "#35B779", "#FDE725"),
+  repel = TRUE,
+  geom.var = c("arrow", "text"),
+  select.var = list(contrib = 10)
+)
+```
+
+# Fitting a lasso regression model for predicting X
+
+```{r}
+#| include: false
+
+pca_features <- cbind(
+  merged_data[, .(x_input_m, y_input_m, s_mps, a_mps2, dir, o,
+                  dist_to_ball_m, kinetic_energy,
+                  ball_land_x_m, ball_land_y_m, player_height_m,
+                  player_weight_kg, bmi, player_age,
+                  absolute_yardline_number, dist_to_sideline, dist_to_endzone)],
+  position_dummies,
+  role_dummies
+)
+
+x <- data.matrix(pca_features)
+y <- merged_data$x_output
+
+#perform k-fold cross-validation to find optimal lambda value
+cv_model <- cv.glmnet(x, y, alpha = 1)
+
+#find optimal lambda value that minimizes test MSE
+best_lambda <- cv_model$lambda.min
+best_lambda
+
+
+#produce plot of test MSE by lambda value
+plot(cv_model)
+
+
+best_model <- glmnet(x, y, alpha = 1, lambda = best_lambda)
+coef(best_model)
+```
+
+# Fitting a lasso regression model for predicting Y
+
+```{r}
+#| include: false
+
+x <- data.matrix(pca_features)
+y <- merged_data$y_output
+
+#perform k-fold cross-validation to find optimal lambda value
+cv_model <- cv.glmnet(x, y, alpha = 1)
+
+#find optimal lambda value that minimizes test MSE
+best_lambda <- cv_model$lambda.min
+best_lambda
+
+
+#produce plot of test MSE by lambda value
+plot(cv_model)
+
+
+best_model <- glmnet(x, y, alpha = 1, lambda = best_lambda)
+coef(best_model)
+```
