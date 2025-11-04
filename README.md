@@ -5,25 +5,33 @@
 graph TD
     subgraph "Phase 1: Data Preparation"
         A[Start] --> B(Import Libraries);
-        B --> C["Load & Explore Data\n(EDA)"];
-        C --> D["Data Preprocessing\n(Cleaning, Scaling, Encoding)"];
+        B --> C["Load & Explore Data
+                (EDA)"];
+        C --> D["Data Preprocessing
+                (Cleaning, Scaling, Encoding)"];
         D --> E(Feature Engineering & Selection);
-        E --> F["Split Data\n(Train/Validation/Test)"];
+        E --> F["Split Data
+                (Train/Validation/Test)"];
     end
 
     subgraph "Phase 2: Modeling & Optimisation (Iterative Cycle)"
         F --> G{Select Model Architecture};
-        G --> H["Train Model\n(on Training Data)"];
-        H --> I["Evaluate Model\n(on Test Data)"];
+        G --> H["Train Model
+                    (on Training Data)"];
+        H --> I["Evaluate Model
+                    (on Test Data)"];
         I --> J{Is Performance Acceptable?};
-        J -- No --> K["Optimise Model\n(e.g., Hyperparameter Tuning)"];
+        J -- No --> K["Optimise Model
+                    (e.g., Hyperparameter Tuning)"];
         K --> H;
-        J -- Yes --> L["Discussion & Interpretation\n(Analyze results, limitations, insights)"];
+        J -- Yes --> L["Discussion & Interpretation
+                    (Analyze results, limitations, insights)"];
     end
 
     subgraph "Phase 3: Finalization"
         L --> M[Submission on Kaggle];
-        M --> N["Final Evaluation\n(on Unseen Test Data)"];
+        M --> N["Final Evaluation
+                    (on Unseen Test Data)"];
         N --> O[End];
     end
 
