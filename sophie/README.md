@@ -121,26 +121,107 @@ The models investigated include:
     * `RandomForestRegressor` and `BaggingRegressor` were able to train very quickly in parallel using `n_jobs=-1`.
     * `LGBMRegressor` was significantly faster than the standard `GradientBoostingRegressor`.
 
-## Future Work & Next Steps
+## Advanced Implementation: Specialized LightGBM Architectures
+Building upon the initial exploration, the final solution adopted a specialized approach using LightGBM. Instead of a single multi-output model, the problem was decomposed into four distinct regressors. This "Divide and Conquer" strategy allowed each model to specialize in specific physics and behaviors.
 
-### 1. Implement a Robust Validation Strategy
+1. The 4-Model Strategy
+Players on Offense and Defense behave fundamentally differently. Offensive players run pre-planned routes, while defenders react. Similarly, downfield movement (X) involves different physics (sprinting) than lateral movement (Y) (cutting/shuffling).
+Model 1 (Offense X) & Model 2 (Offense Y): Trained exclusively on offensive players to capture route-running logic.
+Model 3 (Defense X) & Model 4 (Defense Y): Trained exclusively on defenders to capture pursuit angles and reaction times.
 
-* **Problem:** The current model is evaluated using a single `train_test_split`. This provides a quick estimate, but the resulting Mean Squared Error (MSE) could be "lucky" or "unlucky" depending on how that one split was made.
-* **Solution:** Implement **K-Fold Cross-Validation** (with K=5 or K=10).
-    * This technique involves splitting the training data into K folds, then training and testing the model K times.
-    * The **average** of the K MSE scores will provide a much more stable and reliable measure of the model's true performance on unseen data. This is essential before starting any serious hyperparameter tuning.
+2. Bayesian Optimization (Optuna)
+To maximize performance, default hyperparameters were replaced with values tuned via Optuna.
+Validation Strategy: A GroupKFold (3 splits) was used, grouping by GameID. This ensures that frames from the same game never appear in both the training and validation sets, preventing "data leakage" and ensuring the model generalizes to unseen games.
 
-### 2. Hyperparameter Tuning
+Metric: The models were optimized to minimize RMSE (Root Mean Squared Error).
 
-* **Problem:** All models are currently using their default parameters (e.g., `n_estimators=100`). These are almost never the optimal settings for a specific dataset.
-* **Solution:** Use `RandomizedSearchCV` to find the best-performing hyperparameters for the top 2-3 "champion" models (e.g., `LGBMRegressor`, `ElasticNet`, `RandomForestRegressor`).
-    * `RandomizedSearchCV` is much faster than `GridSearchCV` and often finds equally good (or better) models by intelligently sampling from a range of possible parameter values.
-    * This search should be run using the K-Fold Cross-Validation strategy (`cv=5`) to find the parameters that perform the best on average.
+3. Comprehensive Feature Expansion
+The feature set was expanded to 147 features, including:
+Lag Features: Previous positions/velocities (t-1, t-2) to capture momentum.
+Rolling Statistics: Moving averages of speed and acceleration.
+Physics: Kinetic energy, estimated time-to-ball, and trajectory alignment.
 
-### 3. Iterative Feature Engineering
-* **Problem:** The current features are good, but may be missing key interactions.
-* **Solution:** Based on the Error Analysis, create new features to address the model's weaknesses.
-    * **Example:** If the model struggles with players who are far away *and* moving fast, an **interaction feature** like `dist_speed_interaction = dist_to_ball * s` could be highly predictive.
+```mermaid
+graph TD
+    %% Setup Styles
+    classDef data fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
+    classDef process fill:#f3e5f5,stroke:#4a148c,stroke-width:2px;
+    classDef decision fill:#fff9c4,stroke:#fbc02d,stroke-width:2px;
+    classDef model fill:#e0f2f1,stroke:#00695c,stroke-width:2px;
+    classDef eval fill:#ffccbc,stroke:#bf360c,stroke-width:2px;
+    classDef api fill:#e0e0e0,stroke:#424242,stroke-width:2px;
+
+    %% --- Phase 1: Data Preparation ---
+    subgraph Prep [Phase 1: Data Prep & Split]
+        Load[Load Data] 
+        -->|Input: 4,880,579 rows| InputInfo(Input Shape: 4.9M x 23)
+        Load -->|Output: 562,936 rows| OutputInfo(Output Shape: 563k x 6)
+        
+        InputInfo & OutputInfo --> MergeFE[Feature Engineering]
+        MergeFE -->|Generate 147 Features| MergedData(Merged Data: 560,426 x 164)
+        
+        MergedData --> Split{Split by Role}
+        Split -->|Offense| OffData(Offense Data: 159,842 rows
+Train: 126k / Val: 33k)
+        Split -->|Defense| DefData(Defense Data: 400,584 rows
+Train: 317k / Val: 83k)
+    end
+
+    %% --- Phase 2: Tuning ---
+    subgraph Tuning [Phase 2: Optimization]
+        OffData & DefData --> CheckTune{Run Optuna?}
+        CheckTune -- Yes --> Optuna[Run Optuna Study]
+        Optuna -->|3-Fold GroupKFold| CV[Cross Validation by GameID]
+        CV -->|Metric: RMSE| BestParams[Found Best Hyperparams]
+        CheckTune -- No --> HardParams[Load Hardcoded Params]
+    end
+
+    %% --- Phase 3: Training ---
+    subgraph Training [Phase 3: Train 4 Specialist Models]
+        BestParams & HardParams --> TrainProcess[Train Separate Regressors]
+        
+        TrainProcess --> M1[Model 1: Offense DX]
+        TrainProcess --> M2[Model 2: Offense DY]
+        TrainProcess --> M3[Model 3: Defense DX]
+        TrainProcess --> M4[Model 4: Defense DY]
+    end
+
+    %% --- Phase 4: Evaluation ---
+    subgraph Eval [Phase 4: Visual Evaluation]
+        M1 & M2 & M3 & M4 --> Viz[Generate Visualizations]
+        Viz --> Plot1[Scatter: Actual vs Predicted
+Check Linearity]
+        Viz --> Plot2[Histogram: Residuals
+Check for Bell Curve @ 0]
+        Viz --> Plot3[Line: Learning Curve
+Train vs Val RMSE]
+    end
+
+    %% --- Phase 5: Submission ---
+    subgraph Submit [Phase 5: Kaggle Inference Loop]
+        StartServer(Init NFLInferenceServer) --> Wait(Wait for Batch)
+        Wait -->|Receive 'test' & 'test_input'| FE_Infer[Engineer Features
+Match 147 cols]
+        
+        FE_Infer --> PredictOff[Predict Offense X/Y]
+        FE_Infer --> PredictDef[Predict Defense X/Y]
+        
+        PredictOff & PredictDef --> MergePred[Merge & Un-Mirror Coords]
+        MergePred --> Send[Submit DataFrame]
+        Send -->|Next Batch| Wait
+    end
+
+    %% Linking Phases
+    Eval -.-> StartServer
+
+    %% Styling
+    class InputInfo,OutputInfo,MergedData,OffData,DefData data;
+    class Load,MergeFE,Split,TrainProcess,FE_Infer,MergePred process;
+    class CheckTune,Split decision;
+    class M1,M2,M3,M4 model;
+    class Plot1,Plot2,Plot3 eval;
+    class StartServer,Wait,Send api;
+```
 
 ##  How to Run
 This project is contained within `[Your-Notebook-Name.ipynb]`.
